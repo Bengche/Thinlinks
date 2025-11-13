@@ -101,7 +101,7 @@ const corsMiddleware = cors({
     // Reject by not allowing credentials but still respond to avoid crashing health checks
     return callback(null, false);
   },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
   optionsSuccessStatus: 204,
