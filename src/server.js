@@ -84,19 +84,24 @@ const resolvedCorsOrigins = (CORS_ORIGIN || defaultCorsOrigins.join(","))
   .filter(Boolean)
   .map((origin) => origin.replace(/\/$/, ""));
 
-const corsOptions = {
-  origin:
-    resolvedCorsOrigins.length === 1
-      ? resolvedCorsOrigins[0]
-      : resolvedCorsOrigins,
+const corsMiddleware = cors({
+  origin: (origin, callback) => {
+    if (!origin) {
+      callback(null, true); // allow curl/health checks
+      return;
+    }
+    const normalized = origin.replace(/\/$/, "");
+    if (resolvedCorsOrigins.includes(normalized)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: ${normalized} not allowed`));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
-  optionsSuccessStatus: 204,
-  preflightContinue: false,
-};
+});
 
-const corsMiddleware = cors(corsOptions);
 app.use(corsMiddleware);
 app.options(/.*/, corsMiddleware);
 
@@ -106,7 +111,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  console.log(
+    `${new Date().toISOString()} ${req.method} ${req.originalUrl} origin=${
+      req.headers.origin || "<none>"
+    }`
+  );
+  res.set("X-Service", "Thinlinks-API");
   next();
 });
 
@@ -114,12 +124,11 @@ app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
 
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled promise rejection:", reason);
-});
-
-process.on("uncaughtException", (error) => {
-  console.error("Uncaught exception:", error);
+app.use((err, req, res, next) => {
+  console.error("Unhandled error during request:", err);
+  if (!res.headersSent) {
+    res.status(500).json({ message: "Internal Server Error" });
+  }
 });
 
 async function initializeDatabase() {
