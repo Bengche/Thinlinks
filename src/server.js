@@ -131,6 +131,25 @@ app.use((err, req, res, next) => {
   }
 });
 
+process.on("SIGTERM", () => {
+  console.warn("Received SIGTERM, shutting down...");
+});
+
+process.on("SIGINT", () => {
+  console.warn("Received SIGINT, shutting down...");
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+});
+
+setInterval(() => {
+  console.log(`${new Date().toISOString()} heartbeat`);
+}, 60 * 1000);
 async function initializeDatabase() {
   try {
     await db.query(`
