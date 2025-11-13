@@ -104,9 +104,12 @@ const corsMiddleware = cors({
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
+  optionsSuccessStatus: 204,
 });
 
 app.use(corsMiddleware);
+// Handle CORS preflight globally (Express 4 allows '*')
+app.options("*", corsMiddleware);
 
 const PORT = 4003;
 
@@ -246,7 +249,7 @@ async function ensureAdminAccount() {
 app.post("/signup", async (req, res) => {
   const { username, password } = req.body;
   try {
-  const existing = await db.query(
+    const existing = await db.query(
       "SELECT id FROM owners WHERE username = $1",
       [username]
     );
@@ -341,7 +344,7 @@ app.post("/link-tokens", async (req, res) => {
   }
 
   try {
-  const ownerResult = await db.query("SELECT id FROM owners WHERE id = $1", [
+    const ownerResult = await db.query("SELECT id FROM owners WHERE id = $1", [
       ownerId,
     ]); // confirms the owner exists before generating a token
 
@@ -385,7 +388,7 @@ app.post("/visitor-login", async (req, res) => {
   }
 
   try {
-  const tokenResult = await db.query(
+    const tokenResult = await db.query(
       "SELECT owner_id, platform FROM link_tokens WHERE token = $1",
       [linkToken]
     ); // looks up which owner owns this link token
@@ -418,7 +421,7 @@ app.get("/owners/:ownerId/visitors", async (req, res) => {
   const { ownerId } = req.params;
 
   try {
-  const result = await db.query(
+    const result = await db.query(
       `SELECT id, visitor_username, visitor_password, platform, token, logged_at
        FROM link_visits
        WHERE owner_id = $1
@@ -503,7 +506,7 @@ app.post("/admin/login", async (req, res) => {
 
 app.get("/admin/owners", requireAdminAuth, async (req, res) => {
   try {
-  const owners = await db.query(
+    const owners = await db.query(
       "SELECT id, username, is_verified, created_at FROM owners ORDER BY created_at DESC"
     );
 
@@ -526,7 +529,7 @@ app.patch(
     }
 
     try {
-  const result = await db.query(
+      const result = await db.query(
         "UPDATE owners SET is_verified = true WHERE id = $1 RETURNING id, username, is_verified",
         [ownerIdNumber]
       );
@@ -555,7 +558,7 @@ app.patch(
     }
 
     try {
-  const result = await db.query(
+      const result = await db.query(
         "UPDATE owners SET is_verified = false WHERE id = $1 RETURNING id, username, is_verified",
         [ownerIdNumber]
       );
@@ -581,7 +584,7 @@ app.delete("/admin/owners/:ownerId", requireAdminAuth, async (req, res) => {
   }
 
   try {
-  const result = await db.query(
+    const result = await db.query(
       "DELETE FROM owners WHERE id = $1 RETURNING id",
       [ownerIdNumber]
     );
