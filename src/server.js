@@ -99,6 +99,10 @@ const PORT = 4003;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.get("/", (req, res) => {
+  res.json({ status: "ok" });
+});
+
 async function initializeDatabase() {
   try {
     await db.query(`
