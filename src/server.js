@@ -37,7 +37,7 @@ const dbConfig = DATABASE_URL
       host: PGHOST || "localhost",
       port: Number(PGPORT) || 1998,
       user: PGUSER || "postgres",
-      password: PGPASSWORD || "Boyalinco$10",
+  password: PGPASSWORD || "",
       database: PGDATABASE || "logs",
       ssl:
         PGSSLMODE === "require"
@@ -68,6 +68,54 @@ const ADMIN_SESSION_TTL_MS =
 const adminSessions = new Map(); // tracks active admin tokens for short-lived access
 const ROOT_SHARE_DOMAIN = THINLINKS_DOMAIN; // optional base domain used when composing share URLs
 const APP_PORT = Number(ENV_PORT) || 4003;
+
+function validatePasswordStrength(password) {
+  if (typeof password !== "string") {
+    return "Password is required.";
+  }
+
+  if (password.length < 12) {
+    return "Password must be at least 12 characters long.";
+  }
+
+  const hasUppercase = /[A-Z]/.test(password);
+  const hasLowercase = /[a-z]/.test(password);
+  const hasNumber = /\d/.test(password);
+  const hasSymbol = /[^A-Za-z0-9]/.test(password);
+
+  if (!hasUppercase || !hasLowercase || !hasNumber || !hasSymbol) {
+    return "Password must include uppercase, lowercase, number, and symbol.";
+  }
+
+  const disallowed = ["password", "123456", "qwerty", "letmein", "welcome"];
+  const normalized = password.toLowerCase();
+  if (disallowed.some((word) => normalized.includes(word))) {
+    return "Password contains common or compromised patterns. Choose something unique.";
+  }
+
+  return null;
+}
+
+async function isPasswordCompromised(password) {
+  const hashHex = crypto.createHash("sha1").update(password).digest("hex").toUpperCase();
+
+  const prefix = hashHex.substring(0, 5);
+  const suffix = hashHex.substring(5);
+  try {
+    const response = await fetch(`https://api.pwnedpasswords.com/range/${prefix}`);
+
+    if (!response.ok) {
+      console.warn("Pwned Passwords API unavailable", response.status);
+      return false; // fail open to avoid blocking signups when API is down
+    }
+
+    const body = await response.text();
+    return body.split("\n").some((line) => line.startsWith(suffix));
+  } catch (error) {
+    console.warn("Failed to verify password against breach database", error);
+    return false; // fail open on network errors
+  }
+}
 
 function cleanupExpiredAdminSessions() {
   const now = Date.now();
@@ -249,6 +297,19 @@ async function ensureAdminAccount() {
 app.post("/signup", async (req, res) => {
   const { username, password } = req.body;
   try {
+    const strengthError = validatePasswordStrength(password);
+    if (strengthError) {
+      return res.status(400).json({ message: strengthError });
+    }
+
+    const compromised = await isPasswordCompromised(password);
+    if (compromised) {
+      return res.status(400).json({
+        message:
+          "That password appears in known data breaches. Please choose a different password.",
+      });
+    }
+
     const existing = await db.query(
       "SELECT id FROM owners WHERE username = $1",
       [username]
@@ -294,12 +355,21 @@ app.post("/login", async (req, res) => {
 
     const storedPassword = user.password || "";
     const isHashed = storedPassword.startsWith("$2");
+
     const passwordMatch = isHashed
       ? await bcrypt.compare(password, storedPassword)
       : storedPassword === password;
 
     if (!passwordMatch) {
       return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const compromised = await isPasswordCompromised(password);
+    if (compromised) {
+      return res.status(403).json({
+        message:
+          "Your password appears in known data breaches. Please contact support to reset it before continuing.",
+      });
     }
 
     if (!isHashed) {
