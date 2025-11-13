@@ -37,7 +37,7 @@ const dbConfig = DATABASE_URL
       host: PGHOST || "localhost",
       port: Number(PGPORT) || 1998,
       user: PGUSER || "postgres",
-  password: PGPASSWORD || "",
+      password: PGPASSWORD || "",
       database: PGDATABASE || "logs",
       ssl:
         PGSSLMODE === "require"
@@ -97,12 +97,18 @@ function validatePasswordStrength(password) {
 }
 
 async function isPasswordCompromised(password) {
-  const hashHex = crypto.createHash("sha1").update(password).digest("hex").toUpperCase();
+  const hashHex = crypto
+    .createHash("sha1")
+    .update(password)
+    .digest("hex")
+    .toUpperCase();
 
   const prefix = hashHex.substring(0, 5);
   const suffix = hashHex.substring(5);
   try {
-    const response = await fetch(`https://api.pwnedpasswords.com/range/${prefix}`);
+    const response = await fetch(
+      `https://api.pwnedpasswords.com/range/${prefix}`
+    );
 
     if (!response.ok) {
       console.warn("Pwned Passwords API unavailable", response.status);
@@ -433,11 +439,13 @@ app.post("/link-tokens", async (req, res) => {
 
     let shareUrl;
 
-    if (ROOT_SHARE_DOMAIN) {
-      const subdomain = sanitizedSubdomain || "share"; // fallback to avoid empty subdomains
-      shareUrl = `https://${subdomain}.${ROOT_SHARE_DOMAIN}/?linkToken=${token}`; // crafts a ready-to-share URL using branded subdomains
+    const routePath = `/${sanitizedSubdomain}`;
+    if (process.env.NODE_ENV === "production") {
+      const baseUrl = ROOT_SHARE_DOMAIN
+        ? `https://${ROOT_SHARE_DOMAIN}`
+        : "https://thinlinks.com";
+      shareUrl = `${baseUrl}${routePath}?linkToken=${token}`;
     } else {
-      const routePath = `/${sanitizedSubdomain}`; // keeps local dev routes aligned with component paths
       shareUrl = `http://localhost:5173${routePath}?linkToken=${token}`;
     }
 
