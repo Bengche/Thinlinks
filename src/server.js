@@ -84,16 +84,19 @@ const resolvedCorsOrigins = (CORS_ORIGIN || defaultCorsOrigins.join(","))
   .filter(Boolean)
   .map((origin) => origin.replace(/\/$/, ""));
 
-app.use(
-  cors({
-    origin:
-      resolvedCorsOrigins.length === 1
-        ? resolvedCorsOrigins[0]
-        : resolvedCorsOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin:
+    resolvedCorsOrigins.length === 1
+      ? resolvedCorsOrigins[0]
+      : resolvedCorsOrigins,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+
+const corsMiddleware = cors(corsOptions);
+app.use(corsMiddleware);
+app.options("*", corsMiddleware);
 
 const PORT = 4003;
 
