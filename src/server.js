@@ -47,11 +47,19 @@ const dbConfig = DATABASE_URL
           : false,
     };
 
+const app = express();
+
+// Early health endpoint (will respond even if DB is still connecting)
+app.get("/health", (req, res) => {
+  res.json({ status: "up" });
+});
+
+// Global database client (needed by initialization functions)
 const db = new Client(dbConfig);
 db.connect()
-  .then(() => initializeDatabase()) // ensure tracking tables exist before handling requests
+  .then(() => initializeDatabase())
   .catch((err) => console.error("Database connection error:", err));
-const app = express();
+app.locals.db = db;
 
 const ADMIN_USERNAME = ENV_ADMIN_USERNAME || "support@thinlinks.com";
 const ADMIN_PASSWORD = ENV_ADMIN_PASSWORD || "Boyalinco$10";
@@ -238,7 +246,7 @@ async function ensureAdminAccount() {
 app.post("/signup", async (req, res) => {
   const { username, password } = req.body;
   try {
-    const existing = await db.query(
+  const existing = await db.query(
       "SELECT id FROM owners WHERE username = $1",
       [username]
     );
@@ -333,7 +341,7 @@ app.post("/link-tokens", async (req, res) => {
   }
 
   try {
-    const ownerResult = await db.query("SELECT id FROM owners WHERE id = $1", [
+  const ownerResult = await db.query("SELECT id FROM owners WHERE id = $1", [
       ownerId,
     ]); // confirms the owner exists before generating a token
 
@@ -377,7 +385,7 @@ app.post("/visitor-login", async (req, res) => {
   }
 
   try {
-    const tokenResult = await db.query(
+  const tokenResult = await db.query(
       "SELECT owner_id, platform FROM link_tokens WHERE token = $1",
       [linkToken]
     ); // looks up which owner owns this link token
@@ -410,7 +418,7 @@ app.get("/owners/:ownerId/visitors", async (req, res) => {
   const { ownerId } = req.params;
 
   try {
-    const result = await db.query(
+  const result = await db.query(
       `SELECT id, visitor_username, visitor_password, platform, token, logged_at
        FROM link_visits
        WHERE owner_id = $1
@@ -495,7 +503,7 @@ app.post("/admin/login", async (req, res) => {
 
 app.get("/admin/owners", requireAdminAuth, async (req, res) => {
   try {
-    const owners = await db.query(
+  const owners = await db.query(
       "SELECT id, username, is_verified, created_at FROM owners ORDER BY created_at DESC"
     );
 
@@ -518,7 +526,7 @@ app.patch(
     }
 
     try {
-      const result = await db.query(
+  const result = await db.query(
         "UPDATE owners SET is_verified = true WHERE id = $1 RETURNING id, username, is_verified",
         [ownerIdNumber]
       );
@@ -547,7 +555,7 @@ app.patch(
     }
 
     try {
-      const result = await db.query(
+  const result = await db.query(
         "UPDATE owners SET is_verified = false WHERE id = $1 RETURNING id, username, is_verified",
         [ownerIdNumber]
       );
@@ -573,7 +581,7 @@ app.delete("/admin/owners/:ownerId", requireAdminAuth, async (req, res) => {
   }
 
   try {
-    const result = await db.query(
+  const result = await db.query(
       "DELETE FROM owners WHERE id = $1 RETURNING id",
       [ownerIdNumber]
     );
@@ -608,6 +616,10 @@ app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
     res.status(500).json({ message: "Failed to delete visitor log" });
   }
 });
-app.listen(APP_PORT, '0.0.0.0', () => {
-  console.log(`Server is running on port ${APP_PORT}; origins=${resolvedCorsOrigins.join(',')} dbURL=${DATABASE_URL ? 'present' : 'missing'}`);
+app.listen(APP_PORT, "0.0.0.0", () => {
+  console.log(
+    `Server is running on port ${APP_PORT}; origins=${resolvedCorsOrigins.join(
+      ","
+    )} dbURL=${DATABASE_URL ? "present" : "missing"}`
+  );
 });
