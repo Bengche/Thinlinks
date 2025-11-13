@@ -81,7 +81,8 @@ const defaultCorsOrigins = [
 const resolvedCorsOrigins = (CORS_ORIGIN || defaultCorsOrigins.join(","))
   .split(",")
   .map((origin) => origin.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .map((origin) => origin.replace(/\/$/, ""));
 
 app.use(
   cors({
@@ -89,7 +90,7 @@ app.use(
       resolvedCorsOrigins.length === 1
         ? resolvedCorsOrigins[0]
         : resolvedCorsOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
   })
 );
