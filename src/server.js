@@ -3,24 +3,63 @@ import { Client } from "pg";
 import cors from "cors";
 import crypto from "crypto"; // generates secure random invite tokens
 import bcrypt from "bcryptjs"; // secures admin credentials with hashing
+import dotenv from "dotenv";
 
-const db = new Client({
-  user: "postgres",
-  host: "localhost",
-  database: "logs",
-  password: "Boyalinco$10",
-  port: 1998,
-});
+dotenv.config();
+
+const {
+  DATABASE_URL,
+  PGHOST,
+  PGPORT,
+  PGUSER,
+  PGPASSWORD,
+  PGDATABASE,
+  PGSSLMODE,
+  PORT: ENV_PORT,
+  CORS_ORIGIN,
+  ADMIN_USERNAME: ENV_ADMIN_USERNAME,
+  ADMIN_PASSWORD: ENV_ADMIN_PASSWORD,
+  ADMIN_SESSION_TTL_HOURS = "12",
+  THINLINKS_DOMAIN = "",
+} = process.env;
+
+const dbConfig = DATABASE_URL
+  ? {
+      connectionString: DATABASE_URL,
+      ssl:
+        PGSSLMODE === "disable"
+          ? false
+          : {
+              rejectUnauthorized: false,
+            },
+    }
+  : {
+      host: PGHOST || "localhost",
+      port: Number(PGPORT) || 1998,
+      user: PGUSER || "postgres",
+      password: PGPASSWORD || "Boyalinco$10",
+      database: PGDATABASE || "logs",
+      ssl:
+        PGSSLMODE === "require"
+          ? {
+              rejectUnauthorized: false,
+            }
+          : false,
+    };
+
+const db = new Client(dbConfig);
 db.connect()
   .then(() => initializeDatabase()) // ensure tracking tables exist before handling requests
   .catch((err) => console.error("Database connection error:", err));
 const app = express();
 
-const ADMIN_USERNAME = "support@thinlinks.com";
-const ADMIN_PASSWORD = "Boyalinco$10";
-const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours to match owner session policy
+const ADMIN_USERNAME = ENV_ADMIN_USERNAME || "support@thinlinks.com";
+const ADMIN_PASSWORD = ENV_ADMIN_PASSWORD || "Boyalinco$10";
+const ADMIN_SESSION_TTL_MS =
+  Number(ADMIN_SESSION_TTL_HOURS) * 60 * 60 * 1000 || 12 * 60 * 60 * 1000; // 12 hours default
 const adminSessions = new Map(); // tracks active admin tokens for short-lived access
-const ROOT_SHARE_DOMAIN = process.env.THINLINKS_DOMAIN || ""; // optional base domain used when composing share URLs
+const ROOT_SHARE_DOMAIN = THINLINKS_DOMAIN; // optional base domain used when composing share URLs
+const APP_PORT = Number(ENV_PORT) || 4003;
 
 function cleanupExpiredAdminSessions() {
   const now = Date.now();
@@ -33,9 +72,23 @@ function cleanupExpiredAdminSessions() {
 
 setInterval(cleanupExpiredAdminSessions, 60 * 60 * 1000); // sweep stale sessions hourly
 
+const defaultCorsOrigins = [
+  "http://localhost:5173",
+  "https://thinlinks.com",
+  "https://www.thinlinks.com",
+];
+
+const resolvedCorsOrigins = (CORS_ORIGIN || defaultCorsOrigins.join(","))
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin:
+      resolvedCorsOrigins.length === 1
+        ? resolvedCorsOrigins[0]
+        : resolvedCorsOrigins,
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
   })
@@ -48,6 +101,16 @@ app.use(express.urlencoded({ extended: true }));
 
 async function initializeDatabase() {
   try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS owners (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        is_verified BOOLEAN DEFAULT false,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `); // core owner accounts table
+
     await db.query(
       `ALTER TABLE owners ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`
     ); // flags accounts that the admin has approved
@@ -140,9 +203,11 @@ app.post("/signup", async (req, res) => {
         .json({ message: "Username already exists. Choose another." });
     }
 
+    const hashedPassword = await bcrypt.hash(password, 12);
+
     const result = await db.query(
       "INSERT INTO owners (username, password) VALUES ($1, $2) RETURNING id, username, is_verified, created_at",
-      [username, password]
+      [username, hashedPassword]
     ); // new sign-ups start unverified until the admin approves them
 
     res.status(201).json({
@@ -160,8 +225,8 @@ app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   try {
     const result = await db.query(
-      "SELECT id, username, is_verified FROM owners WHERE username = $1 AND password = $2",
-      [username, password]
+      "SELECT id, username, password, is_verified FROM owners WHERE username = $1",
+      [username]
     );
 
     if (result.rowCount === 0) {
@@ -169,6 +234,28 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+
+    const storedPassword = user.password || "";
+    const isHashed = storedPassword.startsWith("$2");
+    const passwordMatch = isHashed
+      ? await bcrypt.compare(password, storedPassword)
+      : storedPassword === password;
+
+    if (!passwordMatch) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    if (!isHashed) {
+      try {
+        const upgradedHash = await bcrypt.hash(password, 12);
+        await db.query("UPDATE owners SET password = $1 WHERE id = $2", [
+          upgradedHash,
+          user.id,
+        ]);
+      } catch (upgradeError) {
+        console.error("Failed to upgrade owner password hash:", upgradeError);
+      }
+    }
 
     if (!user.is_verified) {
       return res.status(403).json({
@@ -178,7 +265,11 @@ app.post("/login", async (req, res) => {
 
     res.status(200).json({
       message: "Login successful",
-      user,
+      user: {
+        id: user.id,
+        username: user.username,
+        is_verified: user.is_verified,
+      },
     });
   } catch (error) {
     console.error("Error during login:", error);
@@ -471,6 +562,6 @@ app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
     res.status(500).json({ message: "Failed to delete visitor log" });
   }
 });
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(APP_PORT, () => {
+  console.log(`Server is running on port ${APP_PORT}`);
 });
