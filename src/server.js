@@ -84,18 +84,14 @@ const resolvedCorsOrigins = (CORS_ORIGIN || defaultCorsOrigins.join(","))
   .filter(Boolean)
   .map((origin) => origin.replace(/\/$/, ""));
 
+// Simplified CORS: allow known origins, allow requests with no origin (health checks), never throw
 const corsMiddleware = cors({
   origin: (origin, callback) => {
-    if (!origin) {
-      callback(null, true); // allow curl/health checks
-      return;
-    }
+    if (!origin) return callback(null, true);
     const normalized = origin.replace(/\/$/, "");
-    if (resolvedCorsOrigins.includes(normalized)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: ${normalized} not allowed`));
-    }
+    if (resolvedCorsOrigins.includes(normalized)) return callback(null, true);
+    // Reject by not allowing credentials but still respond to avoid crashing health checks
+    return callback(null, false);
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -103,7 +99,6 @@ const corsMiddleware = cors({
 });
 
 app.use(corsMiddleware);
-app.options(/.*/, corsMiddleware);
 
 const PORT = 4003;
 
@@ -613,6 +608,6 @@ app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
     res.status(500).json({ message: "Failed to delete visitor log" });
   }
 });
-app.listen(APP_PORT, () => {
-  console.log(`Server is running on port ${APP_PORT}`);
+app.listen(APP_PORT, '0.0.0.0', () => {
+  console.log(`Server is running on port ${APP_PORT}; origins=${resolvedCorsOrigins.join(',')} dbURL=${DATABASE_URL ? 'present' : 'missing'}`);
 });
