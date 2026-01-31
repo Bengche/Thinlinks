@@ -25,7 +25,7 @@ if (
   !(PGHOST && PGPORT && PGUSER && PGPASSWORD && PGDATABASE)
 ) {
   console.error(
-    "Database connection variables are missing. Provide DATABASE_URL or the PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE set."
+    "Database connection variables are missing. Provide DATABASE_URL or the PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE set.",
   );
   process.exit(1);
 }
